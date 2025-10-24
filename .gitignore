@@ -1,0 +1,5 @@
+# Ignore CSV and compressed CSV files in this dataset
+*.csv
+*.csv.gz
+
+
