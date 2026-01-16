@@ -1,5 +1,7 @@
-# Ignore CSV and compressed CSV files in this dataset
-*.csv
-*.csv.gz
+# Ignore everything by default
+*
 
-
+# But keep the gitignore itself, directories, and Jupyter notebooks
+!.gitignore
+!*/
+!*.ipynb
