@@ -1,6 +1,6 @@
 # ============================================================
 # FASTRESEG ALL-FOV SCREENING + OPTIONAL TARGETED REFINEMENT
-# PURE RAW MODE (NO H5AD) - CORRECTED VERSION
+# PURE RAW MODE (NO H5AD) - ROBUST COLUMN-CLEANING VERSION
 # ============================================================
 
 # ----------------------------
@@ -62,24 +62,73 @@ master_rds <- file.path(run_root, "FastReseg_master_raw_mode.rds")
 cat("Run root:\n", normalizePath(run_root), "\n\n")
 
 # ----------------------------
-# 3) Read raw metadata and expression safely
+# 3) Helper functions
+# ----------------------------
+clean_names_dt <- function(dt) {
+  nm <- names(dt)
+  nm <- trimws(nm)
+  names(dt) <- nm
+  dt
+}
+
+force_colname <- function(dt, wanted) {
+  nm <- names(dt)
+  if (wanted %in% nm) return(dt)
+  
+  hit <- nm[tolower(nm) == tolower(wanted)]
+  if (length(hit) == 1) {
+    setnames(dt, hit, wanted)
+    return(dt)
+  }
+  
+  stop(sprintf("Could not find required column '%s'. Available columns include: %s",
+               wanted, paste(head(nm, 20), collapse = ", ")))
+}
+
+make_local_color_map <- function(before_ids, after_ids) {
+  before_ids <- sort(unique(as.character(before_ids)))
+  after_ids  <- sort(unique(as.character(after_ids)))
+  
+  shared_ids  <- intersect(before_ids, after_ids)
+  before_only <- setdiff(before_ids, after_ids)
+  after_only  <- setdiff(after_ids, before_ids)
+  
+  ordered_ids <- c(shared_ids, before_only, after_only)
+  cols <- hue_pal()(max(length(ordered_ids), 1))
+  names(cols) <- ordered_ids
+  cols
+}
+
+get_plot_limits <- function(df, pad = 5) {
+  list(
+    xlim = range(df$x_um, na.rm = TRUE) + c(-pad, pad),
+    ylim = range(df$y_um, na.rm = TRUE) + c(-pad, pad)
+  )
+}
+
+# ----------------------------
+# 4) Read raw metadata and expression safely
 # ----------------------------
 cat("[1/10] Reading raw metadata and expression...\n")
 
 meta_all <- as.data.table(fread(meta_file))
 expr_all <- as.data.table(fread(expr_file))
 
-cat("Metadata columns (first 10):\n")
-print(names(meta_all)[1:min(10, length(names(meta_all)))])
-cat("\nExpression columns (first 10):\n")
-print(names(expr_all)[1:min(10, length(names(expr_all)))])
-cat("\n")
+meta_all <- clean_names_dt(meta_all)
+expr_all <- clean_names_dt(expr_all)
 
-# Safety checks
-if (!"fov" %in% names(meta_all)) stop("Column 'fov' not found in metadata file.")
-if (!"fov" %in% names(expr_all)) stop("Column 'fov' not found in expression file.")
-if (!"cell_ID" %in% names(meta_all)) stop("Column 'cell_ID' not found in metadata file.")
-if (!"cell_ID" %in% names(expr_all)) stop("Column 'cell_ID' not found in expression file.")
+# Force critical column names
+meta_all <- force_colname(meta_all, "fov")
+meta_all <- force_colname(meta_all, "cell_ID")
+
+expr_all <- force_colname(expr_all, "fov")
+expr_all <- force_colname(expr_all, "cell_ID")
+
+cat("Metadata columns (first 15):\n")
+print(names(meta_all)[1:min(15, length(names(meta_all)))])
+cat("\nExpression columns (first 15):\n")
+print(names(expr_all)[1:min(15, length(names(expr_all)))])
+cat("\n")
 
 # Build cell labels
 if (!"cell" %in% names(meta_all)) {
@@ -93,7 +142,7 @@ cat("Metadata rows:", nrow(meta_all), "\n")
 cat("Expression rows:", nrow(expr_all), "\n\n")
 
 # ----------------------------
-# 4) Match metadata and expression
+# 5) Match metadata and expression
 # ----------------------------
 cat("[2/10] Matching metadata and expression rows...\n")
 
@@ -109,11 +158,15 @@ expr_all <- expr_all[meta_all$cell]
 cat("Matched cells:", length(common_cells), "\n\n")
 
 # ----------------------------
-# 5) Build counts matrix and cluster vector
+# 6) Build counts matrix and cluster vector
 # ----------------------------
 cat("[3/10] Building counts matrix and cluster vector...\n")
 
-id_cols <- c("fov", "cell_ID", "cell")
+if (!(cluster_col %in% names(meta_all))) {
+  stop(sprintf("Cluster column '%s' not found in metadata.", cluster_col))
+}
+
+id_cols <- intersect(c("fov", "cell_ID", "cell"), names(expr_all))
 gene_cols <- setdiff(names(expr_all), id_cols)
 
 counts_all <- as.matrix(expr_all[, ..gene_cols])
@@ -135,7 +188,7 @@ cat("Unique clusters:", length(unique(clust_all)), "\n")
 cat("Unique FOVs:", length(unique(meta_all[["fov"]])), "\n\n")
 
 # ----------------------------
-# 6) Split transcript file by FOV
+# 7) Split transcript file by FOV
 # ----------------------------
 cat("[4/10] Preparing per-FOV transcript files...\n")
 
@@ -161,12 +214,25 @@ tx_files <- list.files(tx_split_dir, pattern = "^FOV_[0-9]{3}_tx\\.csv$", full.n
 cat("Transcript FOV files:", length(tx_files), "\n\n")
 
 # ----------------------------
-# 7) Build transDF_fileInfo
+# 8) Build transDF_fileInfo
 # ----------------------------
 cat("[5/10] Building transDF_fileInfo...\n")
 
 fov_pos <- as.data.table(fread(fovpos_file))
-if ("FOV" %in% names(fov_pos)) setnames(fov_pos, old = "FOV", new = "fov")
+fov_pos <- clean_names_dt(fov_pos)
+fov_pos <- force_colname(fov_pos, "fov")
+
+# Handle FOV file if it came as uppercase
+if ("FOV" %in% names(fov_pos) && !("fov" %in% names(fov_pos))) {
+  setnames(fov_pos, "FOV", "fov")
+}
+
+required_fovpos <- c("fov", "x_global_mm", "y_global_mm")
+missing_fovpos <- setdiff(required_fovpos, names(fov_pos))
+if (length(missing_fovpos) > 0) {
+  stop(sprintf("Missing required columns in FOV positions file: %s",
+               paste(missing_fovpos, collapse = ", ")))
+}
 
 fov_pos[, stage_X := x_global_mm * 1000]
 fov_pos[, stage_Y := y_global_mm * 1000]
@@ -184,7 +250,7 @@ setorder(file_info, fov)
 cat("transDF_fileInfo rows:", nrow(file_info), "\n\n")
 
 # ----------------------------
-# 8) Run dataset-wide flagging
+# 9) Run dataset-wide flagging
 # ----------------------------
 cat("[6/10] Running dataset-wide FastReseg flagging...\n")
 cat("This is the screening pass across all FOVs.\n")
@@ -233,7 +299,7 @@ res_flag_all <- fastReseg_flag_all_errors(
 saveRDS(res_flag_all, file.path(run_root, "FastReseg_flagging_allFOVs_raw_mode.rds"))
 
 # ----------------------------
-# 9) Summarize flagging across FOVs
+# 10) Summarize flagging across FOVs
 # ----------------------------
 cat("[7/10] Building all-FOV flag summary...\n")
 
@@ -250,7 +316,6 @@ setorder(flag_summary, -pct_flagged, -flagged_cells)
 
 fwrite(flag_summary, file.path(summary_dir, "flag_summary_all_fovs.csv"))
 
-# Threshold suggestion
 pct_thresh <- as.numeric(quantile(flag_summary$pct_flagged, probs = 0.90, na.rm = TRUE))
 n_thresh   <- as.integer(round(as.numeric(quantile(flag_summary$flagged_cells, probs = 0.90, na.rm = TRUE))))
 n_thresh   <- max(10L, n_thresh)
@@ -283,7 +348,6 @@ summary_txt <- c(
 summary_txt_file <- file.path(summary_dir, "FastReseg_screening_summary.txt")
 writeLines(summary_txt, summary_txt_file)
 
-# Save summary plots only
 p_top <- ggplot(head(flag_summary, 30), aes(x = reorder(as.factor(fov), pct_flagged), y = pct_flagged)) +
   geom_col() +
   coord_flip() +
@@ -311,29 +375,8 @@ cat("- pct_flagged >=", round(pct_thresh, 3), "\n")
 cat("- flagged_cells >=", n_thresh, "\n\n")
 
 # ----------------------------
-# 10) Optional full refinement for selected FOVs
+# 11) Optional full refinement for selected FOVs
 # ----------------------------
-make_local_color_map <- function(before_ids, after_ids) {
-  before_ids <- sort(unique(as.character(before_ids)))
-  after_ids  <- sort(unique(as.character(after_ids)))
-  
-  shared_ids  <- intersect(before_ids, after_ids)
-  before_only <- setdiff(before_ids, after_ids)
-  after_only  <- setdiff(after_ids, before_ids)
-  
-  ordered_ids <- c(shared_ids, before_only, after_only)
-  cols <- hue_pal()(max(length(ordered_ids), 1))
-  names(cols) <- ordered_ids
-  cols
-}
-
-get_plot_limits <- function(df, pad = 5) {
-  list(
-    xlim = range(df$x_um, na.rm = TRUE) + c(-pad, pad),
-    ylim = range(df$y_um, na.rm = TRUE) + c(-pad, pad)
-  )
-}
-
 refine_manifest <- list()
 
 if (run_full_refine) {
@@ -353,7 +396,6 @@ if (run_full_refine) {
       one_fov_dir <- file.path(refine_dir, paste0("FOV_", this_fov))
       dir.create(one_fov_dir, recursive = TRUE, showWarnings = FALSE)
       
-      # One-FOV subsets from raw counts + metadata
       meta_fov <- meta_all[meta_all[["fov"]] == this_fov, ]
       expr_fov <- expr_all[expr_all[["fov"]] == this_fov, ]
       
@@ -365,7 +407,7 @@ if (run_full_refine) {
       setkey(expr_fov, cell)
       expr_fov <- expr_fov[meta_fov$cell]
       
-      id_cols <- c("fov", "cell_ID", "cell")
+      id_cols <- intersect(c("fov", "cell_ID", "cell"), names(expr_fov))
       gene_cols <- setdiff(names(expr_fov), id_cols)
       
       counts_fov <- as.matrix(expr_fov[, ..gene_cols])
@@ -376,7 +418,6 @@ if (run_full_refine) {
       clust_fov <- as.character(meta_fov[[cluster_col]])
       names(clust_fov) <- meta_fov$cell
       
-      # One-FOV transcript file info
       file_info_one <- file_info[file_info[["fov"]] == this_fov, ]
       
       set.seed(1)
@@ -485,13 +526,15 @@ if (run_full_refine) {
         summary_file <- file.path(one_fov_dir, paste0("FastReseg_summary_FOV_", this_fov, ".txt"))
         writeLines(summary_lines, summary_file)
         
-        # Plot a few top-changed and average-changed cells, save only
-        poly_fov <- fread(
+        poly_fov <- as.data.table(fread(
           cmd = sprintf(
             "gzip -dc %s | awk -F',' 'NR==1 || $1==%d'",
             shQuote(poly_file), this_fov
           )
-        )
+        ))
+        
+        poly_fov <- clean_names_dt(poly_fov)
+        if (!"cell" %in% names(poly_fov)) stop("Column 'cell' not found in polygon file.")
         
         poly_fov[, x_um := x_local_px * pixel_size_um]
         poly_fov[, y_um := y_local_px * pixel_size_um]
@@ -506,12 +549,10 @@ if (run_full_refine) {
         tx_after[, x_um := x]
         tx_after[, y_um := y]
         
-        # top changed
         cell_change_counts <- updated_transDF[changed == TRUE, .N, by = UMI_cellID]
         setorder(cell_change_counts, -N)
         top_cells <- head(cell_change_counts$UMI_cellID, top_changed_n)
         
-        # average-like changed
         avg_cells <- character(0)
         if (nrow(cell_change_counts) > 0) {
           med_n <- median(cell_change_counts$N)
@@ -594,7 +635,7 @@ if (run_full_refine) {
 }
 
 # ----------------------------
-# 11) Save master object
+# 12) Save master object
 # ----------------------------
 master_obj <- list(
   config = list(
