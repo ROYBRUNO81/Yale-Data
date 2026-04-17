@@ -1,14 +1,24 @@
 # ============================================================
-# FASTRESEG ALL-FOV WORKFLOW USING RAW FILES ONLY
+# run_fastreseg_all_fov.R
 # ============================================================
-# WHAT THIS SCRIPT DOES
-# 1) Reads raw Yale files directly (no adata object)
-# 2) Runs FastReseg FLAGGING on every FOV
-# 3) Saves a dataset-wide flag summary (csv + txt + rds)
-# 4) Suggests a threshold for choosing FOVs to refine
-# 5) Runs FULL FastReseg only on selected FOVs
-# 6) Saves per-FOV full objects, summaries, and plots
-# 7) Saves a master object so you can revisit key FOVs later
+# Full FastReseg run across all FOVs using the same workflow
+# that worked for single FOV runs.
+#
+# Outputs per FOV:
+# - FastReseg_full_fov_<FOV>.rds
+# - FastReseg_summary_FOV_<FOV>.txt
+# - FastReseg_changed_transcripts_FOV_<FOV>.csv
+# - FastReseg_cell_rename_summary_FOV_<FOV>.csv
+# - tutorial_style_before_<cell>.png
+# - tutorial_style_after_<cell>.png
+# - top_changed_before_<cell>.png
+# - top_changed_after_<cell>.png
+#
+# Combined outputs:
+# - all_fov_run_status.csv
+# - all_fov_summary_metrics.csv
+# - all_fov_changed_transcripts.csv
+# - all_fov_cell_rename_summary.csv
 # ============================================================
 
 # -------------------------------
@@ -23,408 +33,222 @@ library(scales)
 # -------------------------------
 # 2) Define input files
 # -------------------------------
-expr_file <- "Raw Data/Colon_TMA_exprMat_file.csv.gz"
-meta_file <- "Raw Data/Colon_TMA_metadata_file.csv.gz"
-tx_file   <- "Raw Data/Colon_TMA_tx_file.csv.gz"
-poly_file <- "Raw Data/Colon_TMA-polygons.csv.gz"
+expr_file   <- "Raw Data/Colon_TMA_exprMat_file.csv.gz"
+meta_file   <- "Raw Data/Colon_TMA_metadata_file.csv.gz"
+tx_file     <- "Raw Data/Colon_TMA_tx_file.csv.gz"
+poly_file   <- "Raw Data/Colon_TMA-polygons.csv.gz"
 fovpos_file <- "Raw Data/Colon_TMA_fov_positions_file.csv.gz"
 
 cluster_col <- "RNA_RNA.QC.Module_Cell.Typing.InSituType.1_1_clusters"
 
 # -------------------------------
-# 3) Define output folders
-# -------------------------------
-root_out <- "FastReseg_allFOV"
-dir.create(root_out, recursive = TRUE, showWarnings = FALSE)
-
-flag_out_dir    <- file.path(root_out, "01_flagging")
-full_out_dir    <- file.path(root_out, "02_full_refinement")
-plot_out_dir    <- file.path(root_out, "03_plots")
-summary_out_dir <- file.path(root_out, "04_summaries")
-object_out_dir  <- file.path(root_out, "05_objects")
-
-dir.create(flag_out_dir, recursive = TRUE, showWarnings = FALSE)
-dir.create(full_out_dir, recursive = TRUE, showWarnings = FALSE)
-dir.create(plot_out_dir, recursive = TRUE, showWarnings = FALSE)
-dir.create(summary_out_dir, recursive = TRUE, showWarnings = FALSE)
-dir.create(object_out_dir, recursive = TRUE, showWarnings = FALSE)
-
-cat("Root output folder:\n", normalizePath(root_out), "\n\n")
-
-# -------------------------------
-# 4) User-tunable settings
+# 3) Global settings
 # -------------------------------
 pixel_size_um <- 0.12028
 zstep_size_um <- 0.8
 
-flagModel_TransNum_cutoff <- 50
-flagCell_lrtest_cutoff <- 2
-svmClass_score_cutoff <- -2
+percent_cores <- 0.25
 
-percentCores_flag <- 0.25
-percentCores_full <- 0.25
-
-# If not NULL, overrides auto-selected FOVs
-manual_selected_fovs <- NULL
-max_refine_fovs <- 20
-
-# Plot settings for refined FOVs
-n_top_changed_cells_to_plot <- 3
-n_average_changed_cells_to_plot <- 2
-plot_radius_px <- 120
-plot_pad_um <- 5
+# Set to NULL to run all FOVs
+fov_subset <- NULL
+# example:
+# fov_subset <- c(7, 232)
 
 # -------------------------------
-# 5) Discover all FOVs
+# 4) Output folders
+# -------------------------------
+root_out <- "FastReseg_allFOV_same_workflow"
+dir.create(root_out, recursive = TRUE, showWarnings = FALSE)
+
+status_dir  <- file.path(root_out, "00_status")
+fov_root    <- file.path(root_out, "01_per_fov")
+summary_dir <- file.path(root_out, "02_combined_outputs")
+
+dir.create(status_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fov_root, recursive = TRUE, showWarnings = FALSE)
+dir.create(summary_dir, recursive = TRUE, showWarnings = FALSE)
+
+cat("Root output folder:\n", normalizePath(root_out), "\n\n")
+
+# -------------------------------
+# 5) Read all metadata once
+# -------------------------------
+cat("Reading metadata file once...\n")
+metadata_all <- fread(meta_file)
+
+if (!"cell" %in% colnames(metadata_all)) {
+  metadata_all[, cell := paste0("c_1_", fov, "_", cell_ID)]
+}
+
+cat("Metadata rows:", nrow(metadata_all), "\n")
+cat("Metadata columns:", ncol(metadata_all), "\n\n")
+
+# -------------------------------
+# 6) Discover FOV list
 # -------------------------------
 fov_positions <- fread(fovpos_file)
 all_fovs <- sort(unique(as.integer(fov_positions$FOV)))
 
-cat("Number of FOVs detected:", length(all_fovs), "\n")
-cat("First 10 FOVs:", paste(head(all_fovs, 10), collapse = ", "), "\n\n")
+if (!is.null(fov_subset)) {
+  all_fovs <- intersect(all_fovs, as.integer(fov_subset))
+}
+
+cat("Total FOVs to run:", length(all_fovs), "\n")
+cat("First 20 FOVs:\n")
+print(head(all_fovs, 20))
+cat("\n")
 
 # -------------------------------
-# 6) Helper functions
+# 7) Containers for combined outputs
 # -------------------------------
+run_status_list <- list()
+summary_metrics_list <- list()
+all_changed_transcripts_list <- list()
+all_cell_rename_summary_list <- list()
 
-read_meta_fov <- function(fov_id) {
-  meta_fov <- fread(
-    cmd = sprintf(
-      "gzip -dc %s | awk -F',' 'NR==1 || $3==%d'",
-      shQuote(meta_file), fov_id
-    )
-  )
-  if (!"cell" %in% colnames(meta_fov)) {
-    meta_fov[, cell := paste0("c_1_", fov, "_", cell_ID)]
-  }
-  meta_fov
-}
-
-read_expr_fov <- function(fov_id) {
-  expr_fov <- fread(
-    cmd = sprintf(
-      "gzip -dc %s | awk -F',' 'NR==1 || $1==%d'",
-      shQuote(expr_file), fov_id
-    )
-  )
-  expr_fov[, cell := paste0("c_1_", fov, "_", cell_ID)]
-  expr_fov
-}
-
-read_tx_fov <- function(fov_id) {
-  fread(
-    cmd = sprintf(
-      "gzip -dc %s | awk -F',' 'NR==1 || $1==%d'",
-      shQuote(tx_file), fov_id
-    )
-  )
-}
-
-read_poly_fov <- function(fov_id) {
-  fread(
-    cmd = sprintf(
-      "gzip -dc %s | awk -F',' 'NR==1 || $1==%d'",
-      shQuote(poly_file), fov_id
-    )
-  )
-}
-
-build_counts_and_clusters <- function(meta_fov, expr_fov, tx_fov, cluster_col, extracellular_cellID) {
-  if (nrow(meta_fov) == 0) stop("meta_fov has 0 rows")
-  if (nrow(expr_fov) == 0) stop("expr_fov has 0 rows")
-  if (nrow(tx_fov) == 0) stop("tx_fov has 0 rows")
-  if (!(cluster_col %in% colnames(meta_fov))) stop("cluster_col not found in meta_fov")
+# -------------------------------
+# 8) Loop over FOVs
+# -------------------------------
+for (idx in seq_along(all_fovs)) {
   
-  common_cells <- intersect(expr_fov$cell, meta_fov$cell)
-  if (length(common_cells) == 0) stop("No common cells between expr_fov and meta_fov")
+  test_fov <- all_fovs[idx]
   
-  expr_fov <- expr_fov[cell %in% common_cells]
-  meta_fov <- meta_fov[cell %in% common_cells]
+  cat("\n====================================================\n")
+  cat(sprintf("[%d / %d] Running FOV %d\n", idx, length(all_fovs), test_fov))
+  cat("====================================================\n")
   
-  setkey(expr_fov, cell)
-  setkey(meta_fov, cell)
-  expr_fov <- expr_fov[meta_fov$cell]
-  
-  id_cols <- c("fov", "cell_ID", "cell")
-  gene_cols <- setdiff(colnames(expr_fov), id_cols)
-  if (length(gene_cols) == 0) stop("No gene columns found in expr_fov")
-  
-  counts_fov <- as.matrix(expr_fov[, ..gene_cols])
-  rownames(counts_fov) <- expr_fov$cell
-  storage.mode(counts_fov) <- "numeric"
-  
-  clust_fov <- as.character(meta_fov[[cluster_col]])
-  names(clust_fov) <- meta_fov$cell
-  
-  genes_tx <- unique(tx_fov$target)
-  common_genes <- intersect(colnames(counts_fov), genes_tx)
-  if (length(common_genes) == 0) stop("No common genes between counts_fov and tx_fov")
-  
-  counts_fov <- counts_fov[, common_genes, drop = FALSE]
-  
-  tx_cells_assigned <- unique(tx_fov$cell)
-  tx_cells_assigned <- setdiff(tx_cells_assigned, extracellular_cellID)
-  
-  pilot_cells <- intersect(rownames(counts_fov), tx_cells_assigned)
-  if (length(pilot_cells) == 0) stop("No usable assigned cells remain after transcript filtering")
-  
-  counts_fov <- counts_fov[pilot_cells, , drop = FALSE]
-  clust_fov <- clust_fov[pilot_cells]
-  
-  if (is.null(dim(counts_fov))) stop("counts_fov lost matrix dimensions")
-  if (nrow(counts_fov) < 2) stop("counts_fov has fewer than 2 cells")
-  if (ncol(counts_fov) < 2) stop("counts_fov has fewer than 2 genes")
-  if (length(clust_fov) != nrow(counts_fov)) stop("length(clust_fov) does not match nrow(counts_fov)")
-  if (length(clust_fov) == 0) stop("clust_fov is empty")
-  
-  counts_fov <- Matrix::Matrix(counts_fov, sparse = TRUE)
-  
-  list(
-    meta_fov = meta_fov,
-    expr_fov = expr_fov,
-    counts_fov = counts_fov,
-    clust_fov = clust_fov,
-    common_genes = common_genes,
-    pilot_cells = pilot_cells
-  )
-}
-
-extract_flagged_cells <- function(res_obj) {
-  flagged_cells <- character(0)
-  
-  if ("combined_flaggedCells" %in% names(res_obj)) {
-    x <- res_obj$combined_flaggedCells
-    
-    if (is.null(x)) {
-      flagged_cells <- character(0)
-    } else if (is.vector(x) || is.factor(x)) {
-      flagged_cells <- as.character(x)
-    } else if (is.list(x) && length(x) >= 1) {
-      flagged_cells <- unique(as.character(unlist(x)))
-    } else if (is.data.frame(x)) {
-      possible_cols <- c("cell", "cellID", "cell_id", "cell_ID", "UMI_cellID")
-      hit <- intersect(possible_cols, colnames(x))
-      if (length(hit) > 0) {
-        flagged_cells <- unique(as.character(x[[hit[1]]]))
-      }
-    }
-  }
-  
-  unique(flagged_cells)
-}
-
-safe_nrow <- function(x) {
-  if (is.null(x)) return(NA_integer_)
-  if (is.data.frame(x) || is.matrix(x)) return(nrow(x))
-  NA_integer_
-}
-
-make_local_color_map <- function(before_ids, after_ids) {
-  before_ids <- sort(unique(as.character(before_ids)))
-  after_ids  <- sort(unique(as.character(after_ids)))
-  
-  shared_ids  <- intersect(before_ids, after_ids)
-  before_only <- setdiff(before_ids, after_ids)
-  after_only  <- setdiff(after_ids, before_ids)
-  
-  ordered_ids <- c(shared_ids, before_only, after_only)
-  n_ids <- length(ordered_ids)
-  
-  cols <- hue_pal()(max(n_ids, 1))
-  names(cols) <- ordered_ids
-  cols
-}
-
-get_plot_limits <- function(df, pad = 5) {
-  list(
-    xlim = range(df$x_um, na.rm = TRUE) + c(-pad, pad),
-    ylim = range(df$y_um, na.rm = TRUE) + c(-pad, pad)
-  )
-}
-
-save_local_before_after_plots <- function(fov_id, meta_fov, poly_fov, updated_transDF,
-                                          out_dir,
-                                          n_top = 3,
-                                          n_avg = 2,
-                                          radius_px = 120,
-                                          pixel_size_um = 0.12028,
-                                          pad_um = 5) {
-  
+  out_dir <- file.path(fov_root, paste0("FOV_", test_fov))
   dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
   
-  updated_transDF[, changed := UMI_cellID != updated_cellID]
+  start_file <- file.path(status_dir, paste0("FOV_", test_fov, "_STARTED.txt"))
+  writeLines(
+    c(
+      paste("FOV", test_fov, "started"),
+      paste("Time:", as.character(Sys.time()))
+    ),
+    start_file
+  )
   
-  cell_changes <- updated_transDF[, .(
-    total_transcripts = .N,
-    changed_transcripts = sum(changed)
-  ), by = UMI_cellID]
-  cell_changes[, pct_changed := 100 * changed_transcripts / total_transcripts]
-  
-  setorder(cell_changes, -changed_transcripts, -pct_changed)
-  
-  top_cells <- head(cell_changes$UMI_cellID, n_top)
-  
-  nonzero_cells <- cell_changes[pct_changed > 0]
-  avg_cells <- character(0)
-  if (nrow(nonzero_cells) > 0) {
-    target_pct <- median(nonzero_cells$pct_changed)
-    nonzero_cells[, dist_to_median := abs(pct_changed - target_pct)]
-    setorder(nonzero_cells, dist_to_median, -changed_transcripts)
-    avg_cells <- head(setdiff(nonzero_cells$UMI_cellID, top_cells), n_avg)
-  }
-  
-  selected_cells <- unique(c(top_cells, avg_cells))
-  
-  poly_fov <- copy(poly_fov)
-  poly_fov[, x_um := x_local_px * pixel_size_um]
-  poly_fov[, y_um := y_local_px * pixel_size_um]
-  
-  tx_before <- copy(updated_transDF)
-  tx_before[, plot_cellID := UMI_cellID]
-  tx_before[, x_um := x]
-  tx_before[, y_um := y]
-  
-  tx_after <- copy(updated_transDF)
-  tx_after[, plot_cellID := updated_cellID]
-  tx_after[, x_um := x]
-  tx_after[, y_um := y]
-  
-  selected_info <- cell_changes[UMI_cellID %in% selected_cells]
-  fwrite(selected_info, file.path(out_dir, sprintf("FOV_%03d_selected_cells_for_plots.csv", fov_id)))
-  
-  for (tc in selected_cells) {
-    target_row <- meta_fov[cell == tc]
-    if (nrow(target_row) == 0) next
+  fov_result <- tryCatch({
     
-    cx <- target_row$CenterX_local_px[1]
-    cy <- target_row$CenterY_local_px[1]
+    # -------- 3) Read raw metadata for one FOV only --------
+    meta_fov <- copy(metadata_all[fov == test_fov])
     
-    meta_local <- copy(meta_fov)
-    meta_local[, dist_px := sqrt((CenterX_local_px - cx)^2 + (CenterY_local_px - cy)^2)]
-    near_cells <- meta_local[dist_px <= radius_px, cell]
+    cat("Metadata rows in FOV", test_fov, ":", nrow(meta_fov), "\n")
+    cat("Metadata columns:", ncol(meta_fov), "\n\n")
     
-    poly_local <- poly_fov[cell %in% near_cells]
-    tx_before_local <- tx_before[UMI_cellID %in% near_cells | updated_cellID %in% near_cells]
-    tx_after_local  <- tx_after[UMI_cellID %in% near_cells | updated_cellID %in% near_cells]
+    if (nrow(meta_fov) == 0) stop("meta_fov has 0 rows")
     
-    local_colors <- make_local_color_map(
-      before_ids = tx_before_local$plot_cellID,
-      after_ids  = tx_after_local$plot_cellID
-    )
+    if (!"cell" %in% colnames(meta_fov)) {
+      meta_fov[, cell := paste0("c_1_", fov, "_", cell_ID)]
+    }
     
-    lims_before <- get_plot_limits(tx_before_local, pad = pad_um)
-    lims_after  <- get_plot_limits(tx_after_local,  pad = pad_um)
-    
-    p_before <- ggplot() +
-      geom_path(
-        data = poly_local,
-        aes(x = x_um, y = y_um, group = cell),
-        color = "grey55",
-        linewidth = 0.35,
-        alpha = 0.8
-      ) +
-      geom_point(
-        data = tx_before_local,
-        aes(x = x_um, y = y_um, color = plot_cellID),
-        size = 1.4,
-        alpha = 0.9
-      ) +
-      scale_color_manual(values = local_colors, drop = FALSE) +
-      coord_fixed(xlim = lims_before$xlim, ylim = lims_before$ylim) +
-      labs(
-        title = paste("BEFORE -", tc, sprintf("(FOV %d)", fov_id)),
-        x = "x (micron)",
-        y = "y (micron)",
-        color = "original cell ID"
-      ) +
-      theme_minimal(base_size = 14) +
-      theme(
-        plot.title = element_text(size = 16),
-        legend.position = "right"
+    # -------- 4) Read raw expression matrix for one FOV only --------
+    expr_fov <- fread(
+      cmd = sprintf(
+        "gzip -dc %s | awk -F',' 'NR==1 || $1==%d'",
+        shQuote(expr_file), test_fov
       )
-    
-    ggsave(
-      filename = file.path(out_dir, sprintf("FOV_%03d_BEFORE_%s.png", fov_id, tc)),
-      plot = p_before,
-      width = 10,
-      height = 8,
-      dpi = 300
     )
     
-    p_after <- ggplot() +
-      geom_path(
-        data = poly_local,
-        aes(x = x_um, y = y_um, group = cell),
-        color = "grey55",
-        linewidth = 0.35,
-        alpha = 0.8
-      ) +
-      geom_point(
-        data = tx_after_local,
-        aes(x = x_um, y = y_um, color = plot_cellID),
-        size = 1.4,
-        alpha = 0.9
-      ) +
-      scale_color_manual(values = local_colors, drop = FALSE) +
-      coord_fixed(xlim = lims_after$xlim, ylim = lims_after$ylim) +
-      labs(
-        title = paste("AFTER -", tc, sprintf("(FOV %d)", fov_id)),
-        x = "x (micron)",
-        y = "y (micron)",
-        color = "updated cell ID"
-      ) +
-      theme_minimal(base_size = 14) +
-      theme(
-        plot.title = element_text(size = 16),
-        legend.position = "right"
-      )
+    cat("Expression rows in FOV", test_fov, ":", nrow(expr_fov), "\n")
+    cat("Expression columns:", ncol(expr_fov), "\n\n")
     
-    ggsave(
-      filename = file.path(out_dir, sprintf("FOV_%03d_AFTER_%s.png", fov_id, tc)),
-      plot = p_after,
-      width = 10,
-      height = 8,
-      dpi = 300
-    )
-  }
-  
-  invisible(selected_cells)
-}
-
-# -------------------------------
-# 7) ALL-FOV FLAGGING PASS
-# -------------------------------
-flag_summary_list <- vector("list", length(all_fovs))
-names(flag_summary_list) <- as.character(all_fovs)
-
-cat("Starting all-FOV flagging pass...\n\n")
-
-for (i in seq_along(all_fovs)) {
-  fov_id <- all_fovs[i]
-  cat(sprintf("[%d/%d] Flagging FOV %d\n", i, length(all_fovs), fov_id))
-  
-  result_row <- tryCatch({
-    extracellular_cellID <- paste0("c_1_", fov_id, "_0")
+    if (nrow(expr_fov) == 0) stop("expr_fov has 0 rows")
     
-    meta_fov <- read_meta_fov(fov_id)
-    expr_fov <- read_expr_fov(fov_id)
-    tx_fov   <- read_tx_fov(fov_id)
+    expr_fov[, cell := paste0("c_1_", fov, "_", cell_ID)]
     
-    prep <- build_counts_and_clusters(
-      meta_fov = meta_fov,
-      expr_fov = expr_fov,
-      tx_fov = tx_fov,
-      cluster_col = cluster_col,
-      extracellular_cellID = extracellular_cellID
+    # -------- 5) Match metadata cells and expression cells --------
+    common_cells <- intersect(expr_fov$cell, meta_fov$cell)
+    
+    expr_fov <- expr_fov[cell %in% common_cells]
+    meta_fov <- meta_fov[cell %in% common_cells]
+    
+    setkey(expr_fov, cell)
+    setkey(meta_fov, cell)
+    expr_fov <- expr_fov[meta_fov$cell]
+    
+    cat("Matched cells between metadata and expression:", length(common_cells), "\n\n")
+    
+    if (length(common_cells) == 0) stop("No matched cells between metadata and expression")
+    
+    # -------- 6) Build cell x gene counts matrix --------
+    id_cols <- c("fov", "cell_ID", "cell")
+    gene_cols <- setdiff(colnames(expr_fov), id_cols)
+    
+    counts_fov <- as.matrix(expr_fov[, ..gene_cols])
+    rownames(counts_fov) <- expr_fov$cell
+    storage.mode(counts_fov) <- "numeric"
+    counts_fov <- Matrix(counts_fov, sparse = TRUE)
+    
+    cat("Counts matrix dim (cells x genes):", dim(counts_fov)[1], "x", dim(counts_fov)[2], "\n\n")
+    
+    # -------- 7) Extract cluster labels for each cell --------
+    clust_fov <- as.character(meta_fov[[cluster_col]])
+    names(clust_fov) <- meta_fov$cell
+    
+    cat("Number of unique clusters in pilot:", length(unique(clust_fov)), "\n")
+    print(table(clust_fov))
+    cat("\n")
+    
+    # -------- 8) Create a one-FOV transcript file --------
+    tx_fov_file <- file.path(out_dir, paste0("Colon_TMA_tx_fov_", test_fov, ".csv"))
+    
+    cmd_tx <- sprintf(
+      "gzip -dc %s | awk -F',' 'NR==1 || $1==%d' > %s",
+      shQuote(tx_file), test_fov, shQuote(tx_fov_file)
     )
     
-    counts_fov <- prep$counts_fov
-    clust_fov  <- prep$clust_fov
+    system(cmd_tx)
     
-    fov_flag_dir <- file.path(flag_out_dir, sprintf("FOV_%03d", fov_id))
-    dir.create(fov_flag_dir, recursive = TRUE, showWarnings = FALSE)
+    cat("Transcript pilot file written to:\n", normalizePath(tx_fov_file), "\n\n")
     
-    res_flag <- fastReseg_flag_all_errors(
+    # -------- 9) Read one-FOV transcript file --------
+    tx_fov <- fread(tx_fov_file)
+    
+    cat("Transcript rows in pilot FOV:", nrow(tx_fov), "\n")
+    cat("Transcript columns:\n")
+    print(colnames(tx_fov))
+    cat("\n")
+    
+    if (nrow(tx_fov) == 0) stop("tx_fov has 0 rows")
+    
+    # -------- 10) Define extracellular / unassigned transcript bucket --------
+    extracellular_cellID <- paste0("c_1_", test_fov, "_0")
+    
+    cat("Extracellular cell label:", extracellular_cellID, "\n")
+    print(table(tx_fov$cell == extracellular_cellID, useNA = "ifany"))
+    cat("\n")
+    
+    # -------- 11) Keep only genes shared between counts and transcript file --------
+    genes_tx <- unique(tx_fov$target)
+    common_genes <- intersect(colnames(counts_fov), genes_tx)
+    
+    counts_fov <- counts_fov[, common_genes, drop = FALSE]
+    
+    cat("Genes in transcript file:", length(genes_tx), "\n")
+    cat("Genes shared with counts matrix:", length(common_genes), "\n\n")
+    
+    if (length(common_genes) == 0) stop("No common genes between counts and transcript file")
+    
+    # -------- 12) Keep only cells that appear in transcript file --------
+    tx_cells_assigned <- unique(tx_fov$cell)
+    tx_cells_assigned <- setdiff(tx_cells_assigned, extracellular_cellID)
+    
+    pilot_cells <- intersect(rownames(counts_fov), tx_cells_assigned)
+    
+    counts_fov <- counts_fov[pilot_cells, , drop = FALSE]
+    clust_fov <- clust_fov[pilot_cells]
+    
+    cat("Cells used in FastReseg pilot:", length(pilot_cells), "\n")
+    cat("Final counts matrix dim:", dim(counts_fov)[1], "x", dim(counts_fov)[2], "\n\n")
+    
+    if (length(pilot_cells) == 0) stop("No pilot cells remained after transcript filtering")
+    
+    # -------- 13) Run FULL FastReseg pipeline --------
+    set.seed(1)
+    
+    res_full <- fastReseg_full_pipeline(
       counts = counts_fov,
       clust = clust_fov,
       refProfiles = NULL,
@@ -441,422 +265,587 @@ for (i in seq_along(all_fovs)) {
       
       extracellular_cellID = extracellular_cellID,
       
-      flagModel_TransNum_cutoff = flagModel_TransNum_cutoff,
-      flagCell_lrtest_cutoff = flagCell_lrtest_cutoff,
-      svmClass_score_cutoff = svmClass_score_cutoff,
+      flagModel_TransNum_cutoff = 50,
+      flagCell_lrtest_cutoff = 2,
+      svmClass_score_cutoff = -2,
       
-      path_to_output = fov_flag_dir,
-      transDF_export_option = 0,
-      return_trimmed_perCell = FALSE,
+      molecular_distance_cutoff = NULL,
+      cellular_distance_cutoff = NULL,
+      score_baseline = NULL,
+      lowerCutoff_transNum = NULL,
+      higherCutoff_transNum = NULL,
+      
+      groupTranscripts_method = "dbscan",
+      spatialMergeCheck_method = "geometryDiff",
+      cutoff_spatialMerge = 0.5,
+      
+      imputeFlag_missingCTs = TRUE,
+      
+      path_to_output = out_dir,
+      transDF_export_option = 2,
+      save_intermediates = TRUE,
+      return_perCellData = TRUE,
       combine_extra = FALSE,
       
-      percentCores = percentCores_flag,
-      seed_transError = 1
+      seed_process = 1,
+      percentCores = percent_cores
     )
     
-    flagged_cells <- extract_flagged_cells(res_flag)
-    n_flagged <- length(flagged_cells)
-    n_eval <- safe_nrow(res_flag$combined_modStats_ToFlagCells)
-    if (is.na(n_eval)) n_eval <- length(prep$pilot_cells)
+    # -------- 14) Inspect returned objects --------
+    cat("=== RESULT OBJECT NAMES ===\n")
+    print(names(res_full))
+    cat("\n")
     
-    data.table(
-      fov = fov_id,
-      status = "ok",
-      error_message = NA_character_,
-      cells_total = nrow(meta_fov),
-      cells_evaluated = n_eval,
-      flagged_cells = n_flagged,
-      pct_flagged = ifelse(n_eval > 0, 100 * n_flagged / n_eval, NA_real_),
-      transcripts_total = nrow(tx_fov),
-      extracellular_transcripts = sum(tx_fov$cell == extracellular_cellID, na.rm = TRUE),
-      pct_extracellular = 100 * sum(tx_fov$cell == extracellular_cellID, na.rm = TRUE) / max(nrow(tx_fov), 1),
-      common_genes = length(prep$common_genes),
-      cells_used = length(prep$pilot_cells)
+    updated_transDF <- NULL
+    if ("updated_transDF_list" %in% names(res_full) && length(res_full$updated_transDF_list) >= 1) {
+      updated_transDF <- as.data.table(res_full$updated_transDF_list[[1]])
+    }
+    
+    if (is.null(updated_transDF) || nrow(updated_transDF) == 0) {
+      stop("updated_transDF not found in returned object or is empty")
+    }
+    
+    cat("=== updated_transDF preview ===\n")
+    print(dim(updated_transDF))
+    print(head(updated_transDF))
+    cat("\nColumns:\n")
+    print(colnames(updated_transDF))
+    cat("\n")
+    
+    # -------- 15) Tutorial-style before/after transcript assignment plots --------
+    poly_fov <- fread(
+      cmd = sprintf(
+        "gzip -dc %s | awk -F',' 'NR==1 || $1==%d'",
+        shQuote(poly_file), test_fov
+      )
+    )
+    
+    changed_transcripts <- updated_transDF[UMI_cellID != updated_cellID]
+    changed_cells <- unique(changed_transcripts$UMI_cellID)
+    
+    if (length(changed_cells) == 0) {
+      changed_cells <- unique(updated_transDF$UMI_cellID)[1:3]
+    }
+    
+    target_cells <- unique(changed_cells)[1:min(3, length(unique(changed_cells)))]
+    
+    cat("Target cells selected for tutorial-style plots:\n")
+    print(target_cells)
+    cat("\n")
+    
+    poly_fov[, x_um := x_local_px * pixel_size_um]
+    poly_fov[, y_um := y_local_px * pixel_size_um]
+    
+    tx_before <- copy(updated_transDF)
+    tx_before[, plot_cellID := UMI_cellID]
+    tx_before[, x_um := x]
+    tx_before[, y_um := y]
+    
+    tx_after <- copy(updated_transDF)
+    tx_after[, plot_cellID := updated_cellID]
+    tx_after[, x_um := x]
+    tx_after[, y_um := y]
+    
+    get_plot_limits <- function(df, pad = 5) {
+      list(
+        xlim = range(df$x_um, na.rm = TRUE) + c(-pad, pad),
+        ylim = range(df$y_um, na.rm = TRUE) + c(-pad, pad)
+      )
+    }
+    
+    get_local_neighborhood <- function(target_cell, radius_px = 120) {
+      target_row <- meta_fov[cell == target_cell]
+      if (nrow(target_row) == 0) return(NULL)
+      
+      cx <- target_row$CenterX_local_px[1]
+      cy <- target_row$CenterY_local_px[1]
+      
+      meta_local <- copy(meta_fov)
+      meta_local[, dist_px := sqrt((CenterX_local_px - cx)^2 + (CenterY_local_px - cy)^2)]
+      near_cells <- meta_local[dist_px <= radius_px, cell]
+      
+      poly_local <- copy(poly_fov[cell %in% near_cells])
+      tx_before_local <- copy(tx_before[UMI_cellID %in% near_cells | updated_cellID %in% near_cells])
+      tx_after_local  <- copy(tx_after[UMI_cellID %in% near_cells | updated_cellID %in% near_cells])
+      
+      list(
+        target_cell = target_cell,
+        poly_local = poly_local,
+        tx_before_local = tx_before_local,
+        tx_after_local = tx_after_local
+      )
+    }
+    
+    for (tc in target_cells) {
+      nb <- get_local_neighborhood(tc, radius_px = 120)
+      if (is.null(nb)) next
+      
+      lims_before <- get_plot_limits(nb$tx_before_local)
+      
+      p_before <- ggplot() +
+        geom_path(
+          data = nb$poly_local,
+          aes(x = x_um, y = y_um, group = cell),
+          color = "grey60",
+          linewidth = 0.3,
+          alpha = 0.7
+        ) +
+        geom_point(
+          data = nb$tx_before_local,
+          aes(x = x_um, y = y_um, color = plot_cellID),
+          size = 1.2,
+          alpha = 0.85
+        ) +
+        coord_fixed(xlim = lims_before$xlim, ylim = lims_before$ylim) +
+        labs(
+          title = paste("Original transcript assignment near", tc),
+          x = "x (micron)",
+          y = "y (micron)",
+          color = "original cell ID"
+        ) +
+        theme_minimal(base_size = 14) +
+        theme(
+          legend.position = "right",
+          plot.title = element_text(size = 16)
+        )
+      
+      ggsave(
+        filename = file.path(out_dir, paste0("tutorial_style_before_", tc, ".png")),
+        plot = p_before,
+        width = 10,
+        height = 8,
+        dpi = 300
+      )
+      
+      lims_after <- get_plot_limits(nb$tx_after_local)
+      
+      p_after <- ggplot() +
+        geom_path(
+          data = nb$poly_local,
+          aes(x = x_um, y = y_um, group = cell),
+          color = "grey60",
+          linewidth = 0.3,
+          alpha = 0.7
+        ) +
+        geom_point(
+          data = nb$tx_after_local,
+          aes(x = x_um, y = y_um, color = plot_cellID),
+          size = 1.2,
+          alpha = 0.85
+        ) +
+        coord_fixed(xlim = lims_after$xlim, ylim = lims_after$ylim) +
+        labs(
+          title = paste("Updated transcript assignment near", tc),
+          x = "x (micron)",
+          y = "y (micron)",
+          color = "updated cell ID"
+        ) +
+        theme_minimal(base_size = 14) +
+        theme(
+          legend.position = "right",
+          plot.title = element_text(size = 16)
+        )
+      
+      ggsave(
+        filename = file.path(out_dir, paste0("tutorial_style_after_", tc, ".png")),
+        plot = p_after,
+        width = 10,
+        height = 8,
+        dpi = 300
+      )
+    }
+    
+    saveRDS(res_full, file.path(out_dir, paste0("FastReseg_full_fov_", test_fov, ".rds")))
+    cat("Saved full FastReseg result to:\n", file.path(out_dir, paste0("FastReseg_full_fov_", test_fov, ".rds")), "\n")
+    
+    # -------- 16) Plot TOP 5 most changed cells --------
+    updated_transDF[, changed := UMI_cellID != updated_cellID]
+    
+    cell_change_counts <- updated_transDF[changed == TRUE, .N, by = UMI_cellID]
+    setorder(cell_change_counts, -N)
+    
+    top_cells <- head(cell_change_counts$UMI_cellID, 5)
+    
+    cat("Top 5 cells with most changed transcripts:\n")
+    print(top_cells)
+    cat("\n")
+    
+    if (!"x_um" %in% colnames(poly_fov)) poly_fov[, x_um := x_local_px * pixel_size_um]
+    if (!"y_um" %in% colnames(poly_fov)) poly_fov[, y_um := y_local_px * pixel_size_um]
+    
+    tx_before <- copy(updated_transDF)
+    tx_before[, plot_cellID := UMI_cellID]
+    tx_before[, x_um := x]
+    tx_before[, y_um := y]
+    
+    tx_after <- copy(updated_transDF)
+    tx_after[, plot_cellID := updated_cellID]
+    tx_after[, x_um := x]
+    tx_after[, y_um := y]
+    
+    get_plot_limits <- function(df, pad = 5) {
+      list(
+        xlim = range(df$x_um, na.rm = TRUE) + c(-pad, pad),
+        ylim = range(df$y_um, na.rm = TRUE) + c(-pad, pad)
+      )
+    }
+    
+    make_local_color_map <- function(before_ids, after_ids) {
+      before_ids <- sort(unique(as.character(before_ids)))
+      after_ids  <- sort(unique(as.character(after_ids)))
+      
+      shared_ids   <- intersect(before_ids, after_ids)
+      before_only  <- setdiff(before_ids, after_ids)
+      after_only   <- setdiff(after_ids, before_ids)
+      
+      ordered_ids <- c(shared_ids, before_only, after_only)
+      
+      n_ids <- length(ordered_ids)
+      cols <- hue_pal()(max(n_ids, 1))
+      names(cols) <- ordered_ids
+      
+      cols
+    }
+    
+    for (tc in top_cells) {
+      target_row <- meta_fov[cell == tc]
+      if (nrow(target_row) == 0) next
+      
+      cx <- target_row$CenterX_local_px[1]
+      cy <- target_row$CenterY_local_px[1]
+      
+      meta_fov[, dist := sqrt((CenterX_local_px - cx)^2 + (CenterY_local_px - cy)^2)]
+      near_cells <- meta_fov[dist <= 120, cell]
+      
+      poly_local <- poly_fov[cell %in% near_cells]
+      tx_before_local <- tx_before[UMI_cellID %in% near_cells | updated_cellID %in% near_cells]
+      tx_after_local  <- tx_after[UMI_cellID %in% near_cells | updated_cellID %in% near_cells]
+      
+      local_colors <- make_local_color_map(
+        before_ids = tx_before_local$plot_cellID,
+        after_ids  = tx_after_local$plot_cellID
+      )
+      
+      lims_before <- get_plot_limits(tx_before_local)
+      
+      p_before <- ggplot() +
+        geom_path(
+          data = poly_local,
+          aes(x = x_um, y = y_um, group = cell),
+          color = "grey55",
+          linewidth = 0.35,
+          alpha = 0.8
+        ) +
+        geom_point(
+          data = tx_before_local,
+          aes(x = x_um, y = y_um, color = plot_cellID),
+          size = 1.4,
+          alpha = 0.9
+        ) +
+        scale_color_manual(values = local_colors, drop = FALSE) +
+        coord_fixed(xlim = lims_before$xlim, ylim = lims_before$ylim) +
+        labs(
+          title = paste("BEFORE -", tc),
+          x = "x (micron)",
+          y = "y (micron)",
+          color = "original cell ID"
+        ) +
+        theme_minimal(base_size = 14) +
+        theme(
+          plot.title = element_text(size = 16),
+          legend.position = "right"
+        )
+      
+      ggsave(
+        filename = file.path(out_dir, paste0("top_changed_before_", tc, ".png")),
+        plot = p_before,
+        width = 10,
+        height = 8,
+        dpi = 300
+      )
+      
+      lims_after <- get_plot_limits(tx_after_local)
+      
+      p_after <- ggplot() +
+        geom_path(
+          data = poly_local,
+          aes(x = x_um, y = y_um, group = cell),
+          color = "grey55",
+          linewidth = 0.35,
+          alpha = 0.8
+        ) +
+        geom_point(
+          data = tx_after_local,
+          aes(x = x_um, y = y_um, color = plot_cellID),
+          size = 1.4,
+          alpha = 0.9
+        ) +
+        scale_color_manual(values = local_colors, drop = FALSE) +
+        coord_fixed(xlim = lims_after$xlim, ylim = lims_after$ylim) +
+        labs(
+          title = paste("AFTER -", tc),
+          x = "x (micron)",
+          y = "y (micron)",
+          color = "updated cell ID"
+        ) +
+        theme_minimal(base_size = 14) +
+        theme(
+          plot.title = element_text(size = 16),
+          legend.position = "right"
+        )
+      
+      ggsave(
+        filename = file.path(out_dir, paste0("top_changed_after_", tc, ".png")),
+        plot = p_after,
+        width = 10,
+        height = 8,
+        dpi = 300
+      )
+    }
+    
+    # -------- 17) Clean summary + write to file --------
+    updated_transDF[, changed := UMI_cellID != updated_cellID]
+    
+    total_transcripts <- nrow(updated_transDF)
+    changed_transcripts_n <- sum(updated_transDF$changed)
+    pct_changed <- changed_transcripts_n / total_transcripts * 100
+    
+    cell_changes <- updated_transDF[, .(
+      total = .N,
+      changed = sum(changed)
+    ), by = UMI_cellID]
+    
+    cell_changes[, pct_changed := changed / total * 100]
+    
+    mean_pct <- mean(cell_changes$pct_changed)
+    median_pct <- median(cell_changes$pct_changed)
+    max_pct <- max(cell_changes$pct_changed)
+    
+    cells_gt5 <- sum(cell_changes$pct_changed > 5)
+    cells_gt10 <- sum(cell_changes$pct_changed > 10)
+    
+    summary_text <- paste0(
+      "FastReseg Results Summary (FOV ", test_fov, ")\n",
+      "========================================\n\n",
+      "Dataset size:\n",
+      "- Cells: ", nrow(meta_fov), "\n",
+      "- Transcripts: ", total_transcripts, "\n\n",
+      "Resegmentation:\n",
+      "- Transcripts changed: ", changed_transcripts_n, "\n",
+      "- Percent changed: ", round(pct_changed, 4), "%\n\n",
+      "Per-cell changes:\n",
+      "- Mean % change: ", round(mean_pct, 4), "\n",
+      "- Median % change: ", round(median_pct, 4), "\n",
+      "- Max % change: ", round(max_pct, 4), "\n\n",
+      "Cells affected:\n",
+      "- >5% changed: ", cells_gt5, "\n",
+      "- >10% changed: ", cells_gt10, "\n\n",
+      "Interpretation:\n",
+      if (pct_changed < 0.5 && max_pct < 10) {
+        "Segmentation is mostly correct.\nOnly minor local corrections were needed.\n"
+      } else if (pct_changed < 2) {
+        "Moderate corrections detected.\nSome local improvements present.\n"
+      } else {
+        "Significant segmentation issues detected.\nResegmentation recommended.\n"
+      }
+    )
+    
+    summary_file <- file.path(out_dir, paste0("FastReseg_summary_FOV_", test_fov, ".txt"))
+    writeLines(summary_text, summary_file)
+    
+    cat(summary_text)
+    cat("\nSummary saved to:\n", summary_file, "\n")
+    
+    # -------- 18) Save transcript-level old -> new assignments --------
+    changed_transcripts_dt <- copy(updated_transDF)[UMI_cellID != updated_cellID]
+    
+    keep_cols <- intersect(
+      c(
+        "target",
+        "UMI_cellID",
+        "updated_cellID",
+        "updated_celltype",
+        "score_updated_celltype",
+        "x", "y", "z",
+        "transComp"
+      ),
+      colnames(changed_transcripts_dt)
+    )
+    
+    changed_transcripts_dt <- changed_transcripts_dt[, ..keep_cols]
+    
+    setnames(
+      changed_transcripts_dt,
+      old = c("UMI_cellID", "updated_cellID"),
+      new = c("old_cell", "new_cell"),
+      skip_absent = TRUE
+    )
+    
+    changed_transcripts_dt[, fov := test_fov]
+    setcolorder(changed_transcripts_dt, c("fov", setdiff(colnames(changed_transcripts_dt), "fov")))
+    
+    changed_transcripts_file <- file.path(
+      out_dir,
+      paste0("FastReseg_changed_transcripts_FOV_", test_fov, ".csv")
+    )
+    
+    fwrite(changed_transcripts_dt, changed_transcripts_file)
+    
+    cat("Saved transcript-level changed assignments to:\n", changed_transcripts_file, "\n")
+    cat("Number of changed transcripts:", nrow(changed_transcripts_dt), "\n\n")
+    
+    # -------- 19) Save cell-level old -> new cell name summary --------
+    cell_rename_summary <- copy(updated_transDF)[
+      UMI_cellID != updated_cellID,
+      .(
+        n_changed_transcripts = .N,
+        n_genes_changed = uniqueN(target)
+      ),
+      by = .(old_cell = UMI_cellID, new_cell = updated_cellID)
+    ]
+    
+    setorder(cell_rename_summary, -n_changed_transcripts, old_cell, new_cell)
+    
+    old_cell_totals <- updated_transDF[, .(old_cell_total_transcripts = .N), by = .(old_cell = UMI_cellID)]
+    
+    cell_rename_summary <- merge(
+      cell_rename_summary,
+      old_cell_totals,
+      by = "old_cell",
+      all.x = TRUE
+    )
+    
+    cell_rename_summary[, pct_of_old_cell_transcripts := 100 * n_changed_transcripts / old_cell_total_transcripts]
+    cell_rename_summary[, fov := test_fov]
+    setcolorder(cell_rename_summary, c("fov", setdiff(colnames(cell_rename_summary), "fov")))
+    setorder(cell_rename_summary, -n_changed_transcripts, -pct_of_old_cell_transcripts)
+    
+    cell_rename_file <- file.path(
+      out_dir,
+      paste0("FastReseg_cell_rename_summary_FOV_", test_fov, ".csv")
+    )
+    
+    fwrite(cell_rename_summary, cell_rename_file)
+    
+    cat("Saved cell-level rename summary to:\n", cell_rename_file, "\n")
+    cat("Number of old->new cell mappings:", nrow(cell_rename_summary), "\n\n")
+    
+    # Return objects needed for combined outputs
+    list(
+      status = "success",
+      summary_metrics = data.table(
+        fov = test_fov,
+        n_cells = nrow(meta_fov),
+        n_transcripts = total_transcripts,
+        n_changed_transcripts = changed_transcripts_n,
+        pct_changed = pct_changed,
+        mean_pct_cell_change = mean_pct,
+        median_pct_cell_change = median_pct,
+        max_pct_cell_change = max_pct,
+        cells_gt5pct = cells_gt5,
+        cells_gt10pct = cells_gt10
+      ),
+      changed_transcripts_dt = changed_transcripts_dt,
+      cell_rename_summary = cell_rename_summary
     )
     
   }, error = function(e) {
-    data.table(
-      fov = fov_id,
+    err_msg <- conditionMessage(e)
+    cat("FOV", test_fov, "FAILED:\n", err_msg, "\n\n")
+    
+    fail_file <- file.path(status_dir, paste0("FOV_", test_fov, "_FAILED.txt"))
+    writeLines(
+      c(
+        paste("FOV", test_fov, "failed"),
+        paste("Time:", as.character(Sys.time())),
+        paste("Error:", err_msg)
+      ),
+      fail_file
+    )
+    
+    list(
       status = "failed",
-      error_message = as.character(e$message),
-      cells_total = NA_integer_,
-      cells_evaluated = NA_integer_,
-      flagged_cells = NA_integer_,
-      pct_flagged = NA_real_,
-      transcripts_total = NA_integer_,
-      extracellular_transcripts = NA_integer_,
-      pct_extracellular = NA_real_,
-      common_genes = NA_integer_,
-      cells_used = NA_integer_
+      error_message = err_msg
     )
   })
   
-  flag_summary_list[[as.character(fov_id)]] <- result_row
+  # Save status row
+  if (identical(fov_result$status, "success")) {
+    run_status_list[[length(run_status_list) + 1]] <- data.table(
+      fov = test_fov,
+      status = "success",
+      error_message = NA_character_
+    )
+    
+    summary_metrics_list[[length(summary_metrics_list) + 1]] <- fov_result$summary_metrics
+    all_changed_transcripts_list[[length(all_changed_transcripts_list) + 1]] <- fov_result$changed_transcripts_dt
+    all_cell_rename_summary_list[[length(all_cell_rename_summary_list) + 1]] <- fov_result$cell_rename_summary
+    
+    success_file <- file.path(status_dir, paste0("FOV_", test_fov, "_SUCCESS.txt"))
+    writeLines(
+      c(
+        paste("FOV", test_fov, "completed successfully"),
+        paste("Time:", as.character(Sys.time()))
+      ),
+      success_file
+    )
+  } else {
+    run_status_list[[length(run_status_list) + 1]] <- data.table(
+      fov = test_fov,
+      status = "failed",
+      error_message = fov_result$error_message
+    )
+  }
+  
   gc()
 }
 
-flag_summary <- rbindlist(flag_summary_list, fill = TRUE)
-setorder(flag_summary, -pct_flagged, -flagged_cells)
+# -------------------------------
+# 9) Combine and save all outputs
+# -------------------------------
+cat("\nCombining outputs across all FOVs...\n")
 
-fwrite(flag_summary, file.path(summary_out_dir, "allFOV_flag_summary.csv"))
-saveRDS(flag_summary, file.path(object_out_dir, "allFOV_flag_summary.rds"))
+run_status_dt <- rbindlist(run_status_list, fill = TRUE)
+summary_metrics_dt <- rbindlist(summary_metrics_list, fill = TRUE)
+all_changed_transcripts_dt <- rbindlist(all_changed_transcripts_list, fill = TRUE)
+all_cell_rename_summary_dt <- rbindlist(all_cell_rename_summary_list, fill = TRUE)
+
+fwrite(run_status_dt, file.path(summary_dir, "all_fov_run_status.csv"))
+fwrite(summary_metrics_dt, file.path(summary_dir, "all_fov_summary_metrics.csv"))
+fwrite(all_changed_transcripts_dt, file.path(summary_dir, "all_fov_changed_transcripts.csv"))
+fwrite(all_cell_rename_summary_dt, file.path(summary_dir, "all_fov_cell_rename_summary.csv"))
+
+saveRDS(run_status_dt, file.path(summary_dir, "all_fov_run_status.rds"))
+saveRDS(summary_metrics_dt, file.path(summary_dir, "all_fov_summary_metrics.rds"))
+saveRDS(all_changed_transcripts_dt, file.path(summary_dir, "all_fov_changed_transcripts.rds"))
+saveRDS(all_cell_rename_summary_dt, file.path(summary_dir, "all_fov_cell_rename_summary.rds"))
 
 # -------------------------------
-# 8) AUTO-SELECT FOVS TO REFINE
+# 10) Final run report
 # -------------------------------
-ok_flag_summary <- flag_summary[status == "ok" & !is.na(pct_flagged)]
+n_success <- sum(run_status_dt$status == "success", na.rm = TRUE)
+n_failed  <- sum(run_status_dt$status == "failed", na.rm = TRUE)
 
-pct_threshold_auto <- as.numeric(quantile(ok_flag_summary$pct_flagged, 0.90, na.rm = TRUE))
-nflag_threshold_auto <- max(
-  20L,
-  as.integer(quantile(ok_flag_summary$flagged_cells, 0.75, na.rm = TRUE))
-)
-
-selected_fovs_auto <- ok_flag_summary[
-  pct_flagged >= pct_threshold_auto &
-    flagged_cells >= nflag_threshold_auto
-][order(-pct_flagged, -flagged_cells)]$fov
-
-selected_fovs_auto <- head(selected_fovs_auto, max_refine_fovs)
-
-if (!is.null(manual_selected_fovs)) {
-  selected_fovs <- sort(unique(as.integer(manual_selected_fovs)))
-  selection_mode <- "manual"
-} else {
-  selected_fovs <- selected_fovs_auto
-  selection_mode <- "automatic"
-}
-
-cat("\nFlagging pass complete.\n")
-cat("Suggested refinement threshold based on flag burden:\n")
-cat("- pct_flagged >=", round(pct_threshold_auto, 2), "%\n")
-cat("- flagged_cells >=", nflag_threshold_auto, "\n")
-cat("Selection mode:", selection_mode, "\n")
-cat("Selected FOVs for full refinement:\n")
-print(selected_fovs)
-cat("\n")
-
-flag_summary_txt <- c(
-  "FastReseg all-FOV flagging summary",
+final_report <- c(
+  "FastReseg all-FOV run complete",
   "================================",
+  paste("Time:", as.character(Sys.time())),
+  paste("Total FOVs attempted:", length(all_fovs)),
+  paste("Successful FOVs:", n_success),
+  paste("Failed FOVs:", n_failed),
   "",
-  sprintf("Total FOVs processed: %d", length(all_fovs)),
-  sprintf("Successful FOVs: %d", nrow(flag_summary[status == 'ok'])),
-  sprintf("Failed FOVs: %d", nrow(flag_summary[status == 'failed'])),
-  sprintf("Automatic review threshold for pct_flagged: %.2f%%", pct_threshold_auto),
-  sprintf("Automatic review threshold for flagged_cells: %d", nflag_threshold_auto),
-  sprintf("Selection mode: %s", selection_mode),
-  sprintf(
-    "Selected FOVs for full refinement (%d): %s",
-    length(selected_fovs),
-    ifelse(length(selected_fovs) > 0, paste(selected_fovs, collapse = ", "), "none")
-  ),
-  "",
-  "Top 15 successful FOVs by pct_flagged:",
-  paste(
-    apply(
-      as.matrix(head(ok_flag_summary[order(-pct_flagged, -flagged_cells), .(fov, pct_flagged, flagged_cells, cells_evaluated)], 15)),
-      1,
-      function(x) sprintf("FOV %s: pct_flagged=%s, flagged_cells=%s, cells_evaluated=%s", x[1], x[2], x[3], x[4])
-    ),
-    collapse = "\n"
-  ),
-  "",
-  "Failed FOVs:",
-  if (nrow(flag_summary[status == "failed"]) > 0) {
-    paste(
-      apply(
-        as.matrix(flag_summary[status == "failed", .(fov, error_message)]),
-        1,
-        function(x) sprintf("FOV %s failed: %s", x[1], x[2])
-      ),
-      collapse = "\n"
-    )
-  } else {
-    "None"
-  }
-)
-writeLines(flag_summary_txt, file.path(summary_out_dir, "allFOV_flagging_summary.txt"))
-
-# -------------------------------
-# 9) RUN FULL REFINEMENT ONLY ON SELECTED FOVS
-# -------------------------------
-refine_summary_list <- list()
-
-if (length(selected_fovs) == 0) {
-  cat("No FOVs selected for full refinement under current heuristic.\n")
-} else {
-  cat("Starting full refinement on selected FOVs...\n\n")
-  
-  for (j in seq_along(selected_fovs)) {
-    fov_id <- selected_fovs[j]
-    cat(sprintf("[%d/%d] Full refinement for FOV %d\n", j, length(selected_fovs), fov_id))
-    
-    tryCatch({
-      extracellular_cellID <- paste0("c_1_", fov_id, "_0")
-      
-      meta_fov <- read_meta_fov(fov_id)
-      expr_fov <- read_expr_fov(fov_id)
-      tx_fov   <- read_tx_fov(fov_id)
-      poly_fov <- read_poly_fov(fov_id)
-      
-      prep <- build_counts_and_clusters(
-        meta_fov = meta_fov,
-        expr_fov = expr_fov,
-        tx_fov = tx_fov,
-        cluster_col = cluster_col,
-        extracellular_cellID = extracellular_cellID
-      )
-      
-      counts_fov <- prep$counts_fov
-      clust_fov  <- prep$clust_fov
-      
-      fov_full_dir <- file.path(full_out_dir, sprintf("FOV_%03d", fov_id))
-      dir.create(fov_full_dir, recursive = TRUE, showWarnings = FALSE)
-      
-      res_full <- fastReseg_full_pipeline(
-        counts = counts_fov,
-        clust = clust_fov,
-        refProfiles = NULL,
-        
-        pixel_size = pixel_size_um,
-        zstep_size = zstep_size_um,
-        
-        transcript_df = tx_fov,
-        transID_coln = NULL,
-        transGene_coln = "target",
-        cellID_coln = "cell",
-        spatLocs_colns = c("x_local_px", "y_local_px", "z"),
-        invert_y = TRUE,
-        
-        extracellular_cellID = extracellular_cellID,
-        
-        flagModel_TransNum_cutoff = flagModel_TransNum_cutoff,
-        flagCell_lrtest_cutoff = flagCell_lrtest_cutoff,
-        svmClass_score_cutoff = svmClass_score_cutoff,
-        
-        molecular_distance_cutoff = NULL,
-        cellular_distance_cutoff = NULL,
-        score_baseline = NULL,
-        lowerCutoff_transNum = NULL,
-        higherCutoff_transNum = NULL,
-        
-        imputeFlag_missingCTs = TRUE,
-        groupTranscripts_method = "dbscan",
-        spatialMergeCheck_method = "leidenCut",
-        cutoff_spatialMerge = 0.5,
-        
-        path_to_output = fov_full_dir,
-        transDF_export_option = 2,
-        save_intermediates = TRUE,
-        return_perCellData = TRUE,
-        combine_extra = FALSE,
-        
-        seed_process = 1,
-        percentCores = percentCores_full
-      )
-      
-      updated_transDF <- NULL
-      if ("updated_transDF_list" %in% names(res_full) && length(res_full$updated_transDF_list) >= 1) {
-        updated_transDF <- as.data.table(res_full$updated_transDF_list[[1]])
-      }
-      
-      if (!is.null(updated_transDF)) {
-        updated_transDF[, changed := UMI_cellID != updated_cellID]
-        
-        total_transcripts <- nrow(updated_transDF)
-        changed_transcripts <- sum(updated_transDF$changed)
-        pct_changed <- 100 * changed_transcripts / max(total_transcripts, 1)
-        
-        cell_changes <- updated_transDF[, .(
-          total_transcripts = .N,
-          changed_transcripts = sum(changed)
-        ), by = UMI_cellID]
-        cell_changes[, pct_changed := 100 * changed_transcripts / total_transcripts]
-        
-        mean_pct <- mean(cell_changes$pct_changed)
-        median_pct <- median(cell_changes$pct_changed)
-        max_pct <- max(cell_changes$pct_changed)
-        cells_gt5 <- sum(cell_changes$pct_changed > 5)
-        cells_gt10 <- sum(cell_changes$pct_changed > 10)
-        
-        fwrite(cell_changes, file.path(fov_full_dir, sprintf("FOV_%03d_perCell_change_summary.csv", fov_id)))
-        
-        fov_plot_dir <- file.path(plot_out_dir, sprintf("FOV_%03d", fov_id))
-        selected_cells_for_plots <- save_local_before_after_plots(
-          fov_id = fov_id,
-          meta_fov = meta_fov,
-          poly_fov = poly_fov,
-          updated_transDF = updated_transDF,
-          out_dir = fov_plot_dir,
-          n_top = n_top_changed_cells_to_plot,
-          n_avg = n_average_changed_cells_to_plot,
-          radius_px = plot_radius_px,
-          pixel_size_um = pixel_size_um,
-          pad_um = plot_pad_um
-        )
-        
-        interpretation_line <- if (pct_changed < 0.5 && max_pct < 10) {
-          "Interpretation: segmentation is mostly correct; only minor local corrections were needed."
-        } else if (pct_changed < 2) {
-          "Interpretation: moderate corrections detected; some local improvements are present."
-        } else {
-          "Interpretation: stronger segmentation issues detected; resegmentation appears worthwhile."
-        }
-        
-        fov_summary_text <- c(
-          sprintf("FastReseg Results Summary (FOV %d)", fov_id),
-          "========================================",
-          "",
-          "Dataset size:",
-          sprintf("- Cells: %d", nrow(meta_fov)),
-          sprintf("- Transcripts: %d", total_transcripts),
-          sprintf(
-            "- Extracellular transcripts removed upstream: %d (%.3f%% of transcript rows in this FOV)",
-            sum(tx_fov$cell == extracellular_cellID, na.rm = TRUE),
-            100 * sum(tx_fov$cell == extracellular_cellID, na.rm = TRUE) / max(nrow(tx_fov), 1)
-          ),
-          "",
-          "Resegmentation:",
-          sprintf("- Transcripts changed: %d", changed_transcripts),
-          sprintf("- Percent changed: %.4f%%", pct_changed),
-          "",
-          "Per-cell changes:",
-          sprintf("- Mean %% change: %.4f", mean_pct),
-          sprintf("- Median %% change: %.4f", median_pct),
-          sprintf("- Max %% change: %.4f", max_pct),
-          "",
-          "Cells affected:",
-          sprintf("- >5%% changed: %d", cells_gt5),
-          sprintf("- >10%% changed: %d", cells_gt10),
-          "",
-          interpretation_line,
-          "",
-          sprintf(
-            "Cells plotted for review: %s",
-            ifelse(length(selected_cells_for_plots) > 0, paste(selected_cells_for_plots, collapse = ", "), "none")
-          )
-        )
-        
-        writeLines(
-          fov_summary_text,
-          file.path(fov_full_dir, sprintf("FOV_%03d_FastReseg_summary.txt", fov_id))
-        )
-        
-        refine_summary_list[[as.character(fov_id)]] <- data.table(
-          fov = fov_id,
-          status = "ok",
-          error_message = NA_character_,
-          cells_total = nrow(meta_fov),
-          transcripts_total = total_transcripts,
-          transcripts_changed = changed_transcripts,
-          pct_changed = pct_changed,
-          mean_pct_change_per_cell = mean_pct,
-          median_pct_change_per_cell = median_pct,
-          max_pct_change_per_cell = max_pct,
-          cells_gt5pct = cells_gt5,
-          cells_gt10pct = cells_gt10,
-          selected_for_refinement = TRUE
-        )
-        
-      } else {
-        refine_summary_list[[as.character(fov_id)]] <- data.table(
-          fov = fov_id,
-          status = "failed",
-          error_message = "updated_transDF not found in returned object",
-          cells_total = nrow(meta_fov),
-          transcripts_total = NA_integer_,
-          transcripts_changed = NA_integer_,
-          pct_changed = NA_real_,
-          mean_pct_change_per_cell = NA_real_,
-          median_pct_change_per_cell = NA_real_,
-          max_pct_change_per_cell = NA_real_,
-          cells_gt5pct = NA_integer_,
-          cells_gt10pct = NA_integer_,
-          selected_for_refinement = TRUE
-        )
-      }
-      
-      saveRDS(
-        res_full,
-        file.path(object_out_dir, sprintf("FOV_%03d_FastReseg_full_result.rds", fov_id))
-      )
-      
-      rm(meta_fov, expr_fov, tx_fov, poly_fov, prep, counts_fov, clust_fov, res_full, updated_transDF)
-      gc()
-      
-    }, error = function(e) {
-      refine_summary_list[[as.character(fov_id)]] <<- data.table(
-        fov = fov_id,
-        status = "failed",
-        error_message = as.character(e$message),
-        cells_total = NA_integer_,
-        transcripts_total = NA_integer_,
-        transcripts_changed = NA_integer_,
-        pct_changed = NA_real_,
-        mean_pct_change_per_cell = NA_real_,
-        median_pct_change_per_cell = NA_real_,
-        max_pct_change_per_cell = NA_real_,
-        cells_gt5pct = NA_integer_,
-        cells_gt10pct = NA_integer_,
-        selected_for_refinement = TRUE
-      )
-    })
-  }
-}
-
-# -------------------------------
-# 10) SAVE MASTER OUTPUTS
-# -------------------------------
-if (length(refine_summary_list) > 0) {
-  refine_summary <- rbindlist(refine_summary_list, fill = TRUE)
-  setorder(refine_summary, -pct_changed)
-  fwrite(refine_summary, file.path(summary_out_dir, "selectedFOV_full_refinement_summary.csv"))
-  saveRDS(refine_summary, file.path(object_out_dir, "selectedFOV_full_refinement_summary.rds"))
-} else {
-  refine_summary <- data.table()
-}
-
-master_obj <- list(
-  all_fovs = all_fovs,
-  selected_fovs = selected_fovs,
-  flag_summary = flag_summary,
-  refine_summary = refine_summary,
-  settings = list(
-    pixel_size_um = pixel_size_um,
-    zstep_size_um = zstep_size_um,
-    flagModel_TransNum_cutoff = flagModel_TransNum_cutoff,
-    flagCell_lrtest_cutoff = flagCell_lrtest_cutoff,
-    svmClass_score_cutoff = svmClass_score_cutoff,
-    percentCores_flag = percentCores_flag,
-    percentCores_full = percentCores_full,
-    pct_threshold_auto = pct_threshold_auto,
-    nflag_threshold_auto = nflag_threshold_auto,
-    selection_mode = selection_mode,
-    manual_selected_fovs = manual_selected_fovs,
-    max_refine_fovs = max_refine_fovs
-  )
+  "Combined output files:",
+  paste("-", file.path(summary_dir, "all_fov_run_status.csv")),
+  paste("-", file.path(summary_dir, "all_fov_summary_metrics.csv")),
+  paste("-", file.path(summary_dir, "all_fov_changed_transcripts.csv")),
+  paste("-", file.path(summary_dir, "all_fov_cell_rename_summary.csv"))
 )
 
-saveRDS(master_obj, file.path(object_out_dir, "FastReseg_master_object.rds"))
+writeLines(final_report, file.path(summary_dir, "FINAL_REPORT.txt"))
 
-final_summary_txt <- c(
-  "FastReseg Yale Colon all-FOV workflow complete",
-  "==============================================",
-  "",
-  sprintf("Total FOVs processed in flagging: %d", length(all_fovs)),
-  sprintf("Successful FOVs in flagging: %d", nrow(flag_summary[status == 'ok'])),
-  sprintf("Failed FOVs in flagging: %d", nrow(flag_summary[status == 'failed'])),
-  sprintf("FOVs selected for full refinement: %d", length(selected_fovs)),
-  sprintf("Selected FOV list: %s", ifelse(length(selected_fovs) > 0, paste(selected_fovs, collapse = ", "), "none")),
-  "",
-  sprintf("- Flag summary csv: %s", file.path(summary_out_dir, "allFOV_flag_summary.csv")),
-  sprintf("- Flag summary txt: %s", file.path(summary_out_dir, "allFOV_flagging_summary.txt")),
-  sprintf("- Full refinement summary csv: %s", file.path(summary_out_dir, "selectedFOV_full_refinement_summary.csv")),
-  sprintf("- Master object rds: %s", file.path(object_out_dir, "FastReseg_master_object.rds"))
-)
-writeLines(final_summary_txt, file.path(summary_out_dir, "RUN_COMPLETE.txt"))
-
-cat("\nWorkflow finished.\n")
-cat("Main summary files are in:\n", normalizePath(summary_out_dir), "\n")
-cat("Main objects are in:\n", normalizePath(object_out_dir), "\n")
+cat("\n========================================\n")
+cat("ALL DONE\n")
+cat("========================================\n")
+cat("Successful FOVs:", n_success, "\n")
+cat("Failed FOVs:", n_failed, "\n")
+cat("Combined outputs saved in:\n", normalizePath(summary_dir), "\n")
