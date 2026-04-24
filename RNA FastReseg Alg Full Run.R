@@ -50,9 +50,17 @@ zstep_size_um <- 0.8
 percent_cores <- 0.25
 
 # Set to NULL to run all FOVs
-fov_subset <- NULL
+# fov_subset <- NULL
 # example:
-# fov_subset <- c(7, 232)
+fov_subset <- c(
+  294, 295, 296, 297, 298, 299, 300, 301, 302, 303,
+  304, 305, 306, 307, 308, 309, 310, 311, 312, 313,
+  314, 315, 316, 317, 318, 319, 320, 321, 322, 323,
+  324, 325, 326, 327, 328, 329, 330, 331, 332, 333,
+  334, 335, 336, 337, 338, 339, 340, 341, 342, 343,
+  344, 345, 346, 347, 348, 349, 350, 351, 352, 353,
+  354, 355, 356, 357, 358, 359, 360, 361
+)
 
 # -------------------------------
 # 4) Output folders
@@ -245,51 +253,74 @@ for (idx in seq_along(all_fovs)) {
     
     if (length(pilot_cells) == 0) stop("No pilot cells remained after transcript filtering")
     
-    # -------- 13) Run FULL FastReseg pipeline --------
+    # -------- 13) Run FULL FastReseg pipeline with fallback --------
     set.seed(1)
     
-    res_full <- fastReseg_full_pipeline(
-      counts = counts_fov,
-      clust = clust_fov,
-      refProfiles = NULL,
-      
-      pixel_size = pixel_size_um,
-      zstep_size = zstep_size_um,
-      
-      transcript_df = tx_fov,
-      transID_coln = NULL,
-      transGene_coln = "target",
-      cellID_coln = "cell",
-      spatLocs_colns = c("x_local_px", "y_local_px", "z"),
-      invert_y = TRUE,
-      
-      extracellular_cellID = extracellular_cellID,
-      
-      flagModel_TransNum_cutoff = 50,
-      flagCell_lrtest_cutoff = 2,
-      svmClass_score_cutoff = -2,
-      
-      molecular_distance_cutoff = NULL,
-      cellular_distance_cutoff = NULL,
-      score_baseline = NULL,
-      lowerCutoff_transNum = NULL,
-      higherCutoff_transNum = NULL,
-      
-      groupTranscripts_method = "dbscan",
-      spatialMergeCheck_method = "geometryDiff",
-      cutoff_spatialMerge = 0.5,
-      
-      imputeFlag_missingCTs = TRUE,
-      
-      path_to_output = out_dir,
-      transDF_export_option = 2,
-      save_intermediates = TRUE,
-      return_perCellData = TRUE,
-      combine_extra = FALSE,
-      
-      seed_process = 1,
-      percentCores = percent_cores
+    run_full_once <- function(spatial_merge_method) {
+      fastReseg_full_pipeline(
+        counts = counts_fov,
+        clust = clust_fov,
+        refProfiles = NULL,
+        
+        pixel_size = 0.12028,
+        zstep_size = 0.8,
+        
+        transcript_df = tx_fov,
+        transID_coln = NULL,
+        transGene_coln = "target",
+        cellID_coln = "cell",
+        spatLocs_colns = c("x_local_px", "y_local_px", "z"),
+        invert_y = TRUE,
+        
+        extracellular_cellID = extracellular_cellID,
+        
+        flagModel_TransNum_cutoff = 50,
+        flagCell_lrtest_cutoff = 2,
+        svmClass_score_cutoff = -2,
+        
+        molecular_distance_cutoff = NULL,
+        cellular_distance_cutoff = NULL,
+        score_baseline = NULL,
+        lowerCutoff_transNum = NULL,
+        higherCutoff_transNum = NULL,
+        
+        groupTranscripts_method = "dbscan",
+        spatialMergeCheck_method = spatial_merge_method,
+        cutoff_spatialMerge = 0.5,
+        
+        imputeFlag_missingCTs = TRUE,
+        
+        path_to_output = out_dir,
+        transDF_export_option = 2,
+        save_intermediates = TRUE,
+        return_perCellData = TRUE,
+        combine_extra = FALSE,
+        
+        seed_process = 1,
+        percentCores = 0.25
+      )
+    }
+    
+    merge_method_used <- "geometryDiff"
+    
+    res_full <- tryCatch(
+      {
+        run_full_once("geometryDiff")
+      },
+      error = function(e) {
+        msg <- conditionMessage(e)
+        
+        if (grepl("is\\.owin\\(w\\) is not TRUE", msg)) {
+          cat("geometryDiff failed; retrying with spatialMergeCheck_method = 'none'\n")
+          merge_method_used <<- "none"
+          run_full_once("none")
+        } else {
+          stop(e)
+        }
+      }
     )
+    
+    cat("Merge method used:", merge_method_used, "\n")
     
     # -------- 14) Inspect returned objects --------
     cat("=== RESULT OBJECT NAMES ===\n")
