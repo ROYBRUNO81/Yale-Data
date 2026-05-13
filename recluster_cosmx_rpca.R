@@ -82,6 +82,14 @@ load_h5ad <- function(path) {
     meta <- data.frame(row.names = colnames(mat))
   } else {
     rownames(meta) <- colnames(mat)
+    # Fix type mismatches: convert numeric columns that are whole numbers to integer
+    for (col in colnames(meta)) {
+      if (is.numeric(meta[[col]]) && !is.integer(meta[[col]])) {
+        if (all(meta[[col]] == floor(meta[[col]]), na.rm = TRUE)) {
+          meta[[col]] <- as.integer(meta[[col]])
+        }
+      }
+    }
   }
 
   obj <- CreateSeuratObject(
@@ -151,6 +159,14 @@ load_cosmx_export <- function(counts_mtx, cells_tsv, genes_tsv, obs_csv = NULL) 
       obs$cell <- NULL
     }
     if (nrow(obs) == ncol(mat)) {
+      # Ensure consistent numeric types: convert whole-number doubles to integers
+      for (col in colnames(obs)) {
+        if (is.numeric(obs[[col]]) && !is.integer(obs[[col]])) {
+          if (all(obs[[col]] == floor(obs[[col]]), na.rm = TRUE)) {
+            obs[[col]] <- as.integer(obs[[col]])
+          }
+        }
+      }
       meta <- obs[colnames(mat), , drop = FALSE]
     }
   }
