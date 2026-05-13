@@ -117,6 +117,48 @@ load_sc_half <- function(path, prefix) {
   obj
 }
 
+merge_sc_halves <- function(obj1, obj2) {
+  # Avoid problematic Seurat::merge() by manually concatenating
+  # Get counts matrices
+  mat1 <- GetAssayData(obj1, assay = "RNA", layer = "counts")
+  mat2 <- GetAssayData(obj2, assay = "RNA", layer = "counts")
+  
+  # Ensure same genes and order
+  common_genes <- intersect(rownames(mat1), rownames(mat2))
+  if (length(common_genes) == 0) {
+    stop("No common genes between the two datasets")
+  }
+  
+  mat1 <- mat1[common_genes, ]
+  mat2 <- mat2[common_genes, ]
+  
+  # Concatenate matrices (cbind = add columns/cells)
+  mat_combined <- Matrix::cbind2(mat1, mat2)
+  
+  # Concatenate metadata
+  meta1 <- obj1@meta.data
+  meta2 <- obj2@meta.data
+  
+  # Ensure metadata columns are compatible
+  all_cols <- union(colnames(meta1), colnames(meta2))
+  for (col in all_cols) {
+    if (!(col %in% colnames(meta1))) meta1[[col]] <- NA
+    if (!(col %in% colnames(meta2))) meta2[[col]] <- NA
+  }
+  meta_combined <- rbind(meta1[all_cols], meta2[all_cols])
+  
+  # Create merged Seurat object
+  obj_merged <- CreateSeuratObject(
+    counts = mat_combined,
+    meta.data = meta_combined,
+    assay = "RNA",
+    project = "scRNA_reference"
+  )
+  
+  DefaultAssay(obj_merged) <- "RNA"
+  obj_merged
+}
+
 load_cosmx_export <- function(counts_mtx, cells_tsv, genes_tsv, obs_csv = NULL) {
   required_files <- c(counts_mtx, cells_tsv, genes_tsv)
   missing_files <- required_files[!file.exists(required_files)]
@@ -182,10 +224,9 @@ load_cosmx_export <- function(counts_mtx, cells_tsv, genes_tsv, obs_csv = NULL) 
   obj
 }
 
-sc_ref <- merge(
+sc_ref <- merge_sc_halves(
   load_sc_half(sc1_h5ad, "scRNA1"),
-  y = load_sc_half(sc2_h5ad, "scRNA2"),
-  project = "scRNA_reference"
+  load_sc_half(sc2_h5ad, "scRNA2")
 )
 gc()
 
