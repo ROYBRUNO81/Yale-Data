@@ -23,6 +23,11 @@ out_integrated_rds <- "cosmx_scRNA_rpca_integrated.rds"
 out_cosmx_rds <- "cosmx_rpca_reclustered.rds"
 out_umap_png <- "cosmx_umap_rpca.png"
 
+cosmx_counts_mtx <- "colon_adata_for_seurat_counts.mtx"
+cosmx_cells_tsv <- "colon_adata_for_seurat_cells.tsv"
+cosmx_genes_tsv <- "colon_adata_for_seurat_genes.tsv"
+cosmx_obs_csv <- "colon_adata_for_seurat_obs.csv"
+
 load_h5ad <- function(path) {
   if (!file.exists(path)) {
     stop("Missing file: ", path)
@@ -104,6 +109,63 @@ load_sc_half <- function(path, prefix) {
   obj
 }
 
+load_cosmx_export <- function(counts_mtx, cells_tsv, genes_tsv, obs_csv = NULL) {
+  required_files <- c(counts_mtx, cells_tsv, genes_tsv)
+  missing_files <- required_files[!file.exists(required_files)]
+  if (length(missing_files) > 0) {
+    stop("Missing CosMx export files: ", paste(missing_files, collapse = ", "))
+  }
+
+  mat <- Matrix::readMM(counts_mtx)
+  if (!inherits(mat, "dgCMatrix")) {
+    mat <- as(mat, "dgCMatrix")
+  }
+  cells <- read.delim(cells_tsv, header = FALSE, stringsAsFactors = FALSE)
+  genes <- read.delim(genes_tsv, header = FALSE, stringsAsFactors = FALSE)
+
+  cells <- as.character(cells[[1]])
+  genes <- as.character(genes[[1]])
+
+  if (nrow(mat) != length(genes) || ncol(mat) != length(cells)) {
+    stop(
+      "CosMx export dimensions do not match names: matrix is ",
+      nrow(mat), " x ", ncol(mat),
+      ", genes = ", length(genes),
+      ", cells = ", length(cells)
+    )
+  }
+
+  rownames(mat) <- make.unique(genes)
+  colnames(mat) <- make.unique(cells)
+
+  meta <- data.frame(row.names = colnames(mat))
+  if (!is.null(obs_csv) && file.exists(obs_csv)) {
+    obs <- read.csv(obs_csv, stringsAsFactors = FALSE)
+    if ("cell_id" %in% colnames(obs)) {
+      obs$cell_id <- as.character(obs$cell_id)
+      rownames(obs) <- obs$cell_id
+      obs$cell_id <- NULL
+    } else if ("cell" %in% colnames(obs)) {
+      obs$cell <- as.character(obs$cell)
+      rownames(obs) <- obs$cell
+      obs$cell <- NULL
+    }
+    if (nrow(obs) == ncol(mat)) {
+      meta <- obs[colnames(mat), , drop = FALSE]
+    }
+  }
+
+  obj <- CreateSeuratObject(
+    counts = mat,
+    meta.data = meta,
+    assay = "RNA",
+    project = "colon_adata_for_seurat"
+  )
+
+  DefaultAssay(obj) <- "RNA"
+  obj
+}
+
 sc_ref <- merge(
   load_sc_half(sc1_h5ad, "scRNA1"),
   y = load_sc_half(sc2_h5ad, "scRNA2"),
@@ -111,7 +173,12 @@ sc_ref <- merge(
 )
 gc()
 
-query <- load_h5ad(cosmx_h5ad)
+query <- load_cosmx_export(
+  counts_mtx = cosmx_counts_mtx,
+  cells_tsv = cosmx_cells_tsv,
+  genes_tsv = cosmx_genes_tsv,
+  obs_csv = cosmx_obs_csv
+)
 query <- RenameCells(query, add.cell.id = "CosMx")
 
 sc_ref <- ensure_sct(sc_ref)
