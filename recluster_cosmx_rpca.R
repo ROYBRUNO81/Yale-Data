@@ -119,9 +119,8 @@ load_sc_half <- function(path, prefix) {
 
 merge_sc_halves <- function(obj1, obj2) {
   # Avoid problematic Seurat::merge() by manually concatenating
-  # Extract and ensure matrices are in compatible format
+  # Extract matrices directly from slots
   
-  # Try to get counts - check both possible slots
   if ("counts" %in% names(obj1@assays$RNA)) {
     mat1 <- obj1@assays$RNA@counts
   } else {
@@ -134,38 +133,24 @@ merge_sc_halves <- function(obj1, obj2) {
     mat2 <- obj2@assays$RNA@data
   }
   
-  # Force to dgCMatrix and ensure numeric class
+  # Convert to dgCMatrix
   mat1 <- as(mat1, "dgCMatrix")
   mat2 <- as(mat2, "dgCMatrix")
   
-  # Get common genes
+  # Find common genes
   common_genes <- intersect(rownames(mat1), rownames(mat2))
   if (length(common_genes) == 0) {
     stop("No common genes between the two datasets")
   }
   
-  # Subset to common genes, maintaining order
   mat1 <- mat1[common_genes, ]
   mat2 <- mat2[common_genes, ]
   
   # Concatenate matrices
   mat_combined <- Matrix::cbind2(mat1, mat2)
   
-  # Get and combine metadata
-  meta1 <- obj1@meta.data
-  meta2 <- obj2@meta.data
-  
-  # Simplify metadata - just keep essential columns to avoid type conflicts
-  keep_cols <- c("nCount_RNA", "nFeature_RNA")
-  keep_cols <- keep_cols[keep_cols %in% colnames(meta1) & keep_cols %in% colnames(meta2)]
-  
-  if (length(keep_cols) > 0) {
-    meta1 <- meta1[keep_cols, drop = FALSE]
-    meta2 <- meta2[keep_cols, drop = FALSE]
-    meta_combined <- rbind(meta1, meta2)
-  } else {
-    meta_combined <- data.frame(row.names = colnames(mat_combined))
-  }
+  # Create minimal metadata with just cell names - avoids all type conflicts
+  meta_combined <- data.frame(row.names = colnames(mat_combined))
   
   # Create merged Seurat object
   obj_merged <- CreateSeuratObject(
