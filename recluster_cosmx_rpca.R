@@ -119,33 +119,53 @@ load_sc_half <- function(path, prefix) {
 
 merge_sc_halves <- function(obj1, obj2) {
   # Avoid problematic Seurat::merge() by manually concatenating
-  # Get counts matrices
-  mat1 <- GetAssayData(obj1, assay = "RNA", layer = "counts")
-  mat2 <- GetAssayData(obj2, assay = "RNA", layer = "counts")
+  # Extract and ensure matrices are in compatible format
   
-  # Ensure same genes and order
+  # Try to get counts - check both possible slots
+  if ("counts" %in% names(obj1@assays$RNA)) {
+    mat1 <- obj1@assays$RNA@counts
+  } else {
+    mat1 <- obj1@assays$RNA@data
+  }
+  
+  if ("counts" %in% names(obj2@assays$RNA)) {
+    mat2 <- obj2@assays$RNA@counts
+  } else {
+    mat2 <- obj2@assays$RNA@data
+  }
+  
+  # Force to dgCMatrix and ensure numeric class
+  mat1 <- as(mat1, "dgCMatrix")
+  mat2 <- as(mat2, "dgCMatrix")
+  
+  # Get common genes
   common_genes <- intersect(rownames(mat1), rownames(mat2))
   if (length(common_genes) == 0) {
     stop("No common genes between the two datasets")
   }
   
+  # Subset to common genes, maintaining order
   mat1 <- mat1[common_genes, ]
   mat2 <- mat2[common_genes, ]
   
-  # Concatenate matrices (cbind = add columns/cells)
+  # Concatenate matrices
   mat_combined <- Matrix::cbind2(mat1, mat2)
   
-  # Concatenate metadata
+  # Get and combine metadata
   meta1 <- obj1@meta.data
   meta2 <- obj2@meta.data
   
-  # Ensure metadata columns are compatible
-  all_cols <- union(colnames(meta1), colnames(meta2))
-  for (col in all_cols) {
-    if (!(col %in% colnames(meta1))) meta1[[col]] <- NA
-    if (!(col %in% colnames(meta2))) meta2[[col]] <- NA
+  # Simplify metadata - just keep essential columns to avoid type conflicts
+  keep_cols <- c("nCount_RNA", "nFeature_RNA")
+  keep_cols <- keep_cols[keep_cols %in% colnames(meta1) & keep_cols %in% colnames(meta2)]
+  
+  if (length(keep_cols) > 0) {
+    meta1 <- meta1[keep_cols, drop = FALSE]
+    meta2 <- meta2[keep_cols, drop = FALSE]
+    meta_combined <- rbind(meta1, meta2)
+  } else {
+    meta_combined <- data.frame(row.names = colnames(mat_combined))
   }
-  meta_combined <- rbind(meta1[all_cols], meta2[all_cols])
   
   # Create merged Seurat object
   obj_merged <- CreateSeuratObject(
